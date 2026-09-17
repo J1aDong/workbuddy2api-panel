@@ -519,6 +519,11 @@ function openAdd() {
   $('addVeil').classList.add('on');
   // 重置到选域态：选域可见、加载/就绪/完成/错误全收，起始按钮亮起。
   $('addPick').hidden = false;
+  // 批量导入区一并重置（结果与状态清空，保留上次输入的目录便于重试）。
+  $('importState').hidden = true; $('importState').textContent = '';
+  $('importState').className = 'state';
+  $('importResults').hidden = true; $('importResults').innerHTML = '';
+  $('btnImport').disabled = false;
   $('addLoad').hidden = true; $('addReady').hidden = true;
   $('addDone').hidden = true; $('addErr').hidden = true;
   $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
@@ -569,6 +574,32 @@ $('btnStartLogin').onclick = startAddLogin;
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
 $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
+
+/* ── 批量导入凭证 ─────────────────────────────────────────────────── */
+$('btnImport').onclick = async () => {
+  const btn = $('btnImport'), st = $('importState'), list = $('importResults');
+  btn.disabled = true;
+  st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">正在扫描并导入</span>';
+  list.hidden = true; list.innerHTML = '';
+  try {
+    const r = await api('accounts/import', { method: 'POST', body: JSON.stringify({ dir: $('importDir').value.trim() }) });
+    st.className = 'state ' + (r.failed ? 'err' : 'ok');
+    st.textContent = '扫描 ' + r.total + ' 个文件：导入 ' + r.imported + '，跳过 ' + r.skipped + '，失败 ' + r.failed;
+    if (r.results && r.results.length) {
+      list.innerHTML = r.results.map(x => {
+        const tag = x.action === 'imported' ? '<span style="color:var(--ok)">✓ 已导入</span>'
+          : x.action === 'skipped' ? '<span style="color:var(--ink-3)">– 跳过</span>'
+          : '<span style="color:var(--bad)">✗ 失败</span>';
+        const reason = x.reason ? ' <span style="color:var(--ink-3)">' + esc(x.reason) + '</span>' : '';
+        return '<div>' + tag + ' <span style="color:var(--ink-2)">' + esc(x.file) + '</span>' + (x.uid ? ' <span style="color:var(--ink-3)">' + esc(x.uid) + '</span>' : '') + reason + '</div>';
+      }).join('');
+      list.hidden = false;
+    }
+    loadOverview(true);
+  } catch (e) {
+    st.className = 'state err'; st.textContent = e.message;
+  } finally { btn.disabled = false; }
+};
 
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */
 $('btnAdd').onclick = openAdd;

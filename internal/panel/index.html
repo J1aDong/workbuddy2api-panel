@@ -863,7 +863,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
 <!-- 添加账号 -->
 <div class="veil" id="addVeil">
-  <div class="dlg">
+  <div class="dlg" style="width:640px">
     <header>
       <h3>添加账号</h3>
       <div class="hint">浏览器完成腾讯账号登录，网关自动接续签到并载入账号池，无需重启。</div>
@@ -876,6 +876,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <label class="realm-opt"><input type="radio" name="addRealm" value="global"> 国际版（Global）</label>
         </div>
         <div class="hint" style="font-size:12px;margin-top:2px">国际版登录后，网关自动完成注册地区、激活与试用额度领取，全程无需手动操作。</div>
+        <div style="border-top:1px solid var(--line-soft);margin:14px 0 12px"></div>
+        <div class="hint" style="font-size:12.5px;font-weight:620;color:var(--ink-2)">批量导入凭证目录</div>
+        <div class="hint" style="font-size:12px;margin-top:3px">扫描目录下 codebuddy_*.json（CodeBuddy CLI 凭证），转换后直接载入账号池，无需浏览器登录。</div>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <input type="text" id="importDir" placeholder="留空 = 默认 ~/.codebuddy2api/credentials" style="flex:1" autocomplete="off">
+          <button id="btnImport" style="flex:none">导入</button>
+        </div>
+        <div id="importState" class="state" hidden style="margin-top:8px"></div>
+        <div id="importResults" hidden style="margin-top:8px;max-height:180px;overflow:auto;font-size:12px;line-height:1.9"></div>
       </div>
       <div id="addLoad" class="state" hidden><span class="dots">正在获取授权链接</span></div>
       <div id="addReady" hidden>
