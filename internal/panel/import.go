@@ -1,8 +1,12 @@
-// import.go 批量导入外部凭证目录的账号（面板「添加账号」弹窗内的导入入口）。
+// import.go 批量导入凭证文件（面板「添加账号」弹窗内的导入入口）。
 //
-// 来源：CodeBuddy CLI 网关（~/.codebuddy2api/credentials/codebuddy_<uid>.json）的
-// 扁平格式凭证，转换为本项目 auths/ 目录的嵌套格式（auth.Parse 双形态中的嵌套形），
-// 复用登录路径的热加载语义（SaveAtomic 落盘 → pool.Add → Revive）免重启进池。
+// 来源：CodeBuddy CLI 网关导出的扁平凭证文件（codebuddy_<uid>.json：bearer_token/
+// refresh_token / uid / domain…），经浏览器文件选择器 multipart 多文件上传到面板，
+// 转换为 auths/ 的嵌套格式（auth.Parse 双形态中的嵌套形），复用登录路径的热加载
+// 语义（SaveAtomic 落盘 → pool.Add → Revive）免重启进池。
+//
+// 走上传而非服务端路径扫描：网关常部署在 Docker / 远端，宿主机上的凭证目录在
+// 容器内不可见；把文件内容传进来，部署位置不再约束导入。
 //
 // 导入即信任：与手工放置凭证文件等效（面板本身受 Bearer 鉴权保护），字段校验
 // 只负责防脏数据与路径穿越，不做上游连通性预检（导入后由保活/余额刷新自然暴露）。
@@ -13,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -20,6 +25,14 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+)
+
+// 导入上限：单文件 4MB（真实凭证含 usage_raw 约 100KB，余量充足）、单次 200 个、
+// 总体积 128MB——防异常上传拖垮面板，同时远超正常使用量。
+const (
+	importMaxFileBytes   int64 = 4 << 20
+	importMaxFiles             = 200
+	importMaxTotalBytes int64 = 128 << 20
 )
 
 // codebuddyCred 源凭证的关心字段（扁平形；usage_raw 等大对象不解析）。
@@ -42,14 +55,9 @@ type importResult struct {
 	Reason string `json:"reason,omitempty"`
 }
 
-// importRequest/importResponse 端点入参与返回。
-type importRequest struct {
-	Dir string `json:"dir"`
-}
-
+// importResponse 端点返回。
 type importResponse struct {
 	Ok       bool           `json:"ok"`
-	Dir      string         `json:"dir"`
 	Total    int            `json:"total"`
 	Imported int            `json:"imported"`
 	Skipped  int            `json:"skipped"`
@@ -57,44 +65,32 @@ type importResponse struct {
 	Results  []importResult `json:"results"`
 }
 
-// importAccounts 批量导入：扫描 dir 下 codebuddy_*.json → 转换 → 落盘 → 热加载。
-// 同步执行（文件数有界、纯本地 IO + 池内存操作），不用异步队列。
+// importAccounts 批量导入：multipart 字段 files（可重复）→ 逐个解析转换 → 落盘 → 热加载。
+// 同步执行（文件数有上限、纯本地 IO + 池内存操作），不用异步队列。
 func (p *Panel) importAccounts(w http.ResponseWriter, r *http.Request) {
-	var req importRequest
-	if r.Body != nil {
-		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<15)).Decode(&req)
-	}
-	dir := strings.TrimSpace(req.Dir)
-	if dir == "" {
-		dir = defaultImportDir()
-	}
-	// 展开 ~（macOS/Linux；Windows 由 os.UserHomeDir 返回 %USERPROFILE%，同样适用）。
-	if strings.HasPrefix(dir, "~") {
-		if home, err := os.UserHomeDir(); err == nil {
-			dir = filepath.Join(home, dir[1:])
-		}
-	}
-	dir = filepath.Clean(dir)
-
-	// 目录必须存在，否则明确报错（前端展示给用户）。
-	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
-		writeErr(w, http.StatusBadRequest, "目录不存在或不可读: "+dir)
+	r.Body = http.MaxBytesReader(w, r.Body, importMaxTotalBytes)
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		writeErr(w, http.StatusBadRequest, "上传解析失败（multipart 格式错误或超过大小上限）: "+err.Error())
 		return
 	}
-
-	files, err := filepath.Glob(filepath.Join(dir, "codebuddy_*.json"))
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "scan failed: "+err.Error())
+	defer func() { _ = r.MultipartForm.RemoveAll() }() // 超过内存阈值的部分落了 tmp 文件，统一清理
+	files := r.MultipartForm.File["files"]
+	if len(files) == 0 {
+		writeErr(w, http.StatusBadRequest, "未上传任何文件（multipart 文件字段名须为 files）")
 		return
 	}
-	resp := importResponse{Ok: true, Dir: dir, Total: len(files)}
+	if len(files) > importMaxFiles {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("一次最多导入 %d 个文件，收到 %d 个", importMaxFiles, len(files)))
+		return
+	}
 	// 新部署 auths/ 目录可能尚不存在（登录路径会建，导入路径自建），缺失时 SaveAtomic 写 tmp 失败。
 	if err := os.MkdirAll(p.cfg.AuthDir, 0o755); err != nil {
 		writeErr(w, http.StatusInternalServerError, "mkdir auth dir: "+err.Error())
 		return
 	}
-	for _, f := range files {
-		res := p.importOne(f)
+	resp := importResponse{Ok: true, Total: len(files)}
+	for _, fh := range files {
+		res := p.importOne(fh)
 		switch res.Action {
 		case "imported":
 			resp.Imported++
@@ -105,19 +101,35 @@ func (p *Panel) importAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		resp.Results = append(resp.Results, res)
 	}
-	log.Printf("panel: 批量导入 dir=%s total=%d imported=%d skipped=%d failed=%d",
-		dir, resp.Total, resp.Imported, resp.Skipped, resp.Failed)
+	log.Printf("panel: 批量导入 total=%d imported=%d skipped=%d failed=%d",
+		resp.Total, resp.Imported, resp.Skipped, resp.Failed)
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// importOne 转换并导入单个凭证文件，返回逐文件结果。
+// importOne 解析并导入单个上传文件，返回逐文件结果。
 //   - enabled=false → skipped（用户主动停用的号不进池）
-//   - 目标文件已存在 → skipped（不覆盖手工/既有凭证；先删后导可重导）
-//   - 缺 bearer_token/refresh_token 或 uid 非法 → failed（脏数据，需人工处理）
-func (p *Panel) importOne(src string) importResult {
-	base := filepath.Base(src)
-	res := importResult{File: base}
-	raw, err := os.ReadFile(src)
+//   - 同 uid 目标凭证已存在 → skipped（不覆盖既有凭证；先移除可重导）
+//   - 非 JSON / 缺 bearer_token、refresh_token / uid 非法 → failed（脏数据，需人工处理）
+func (p *Panel) importOne(fh *multipart.FileHeader) importResult {
+	// 文件名仅作展示；Base 防客户端传带路径的名字。
+	name := filepath.Base(fh.Filename)
+	if name == "" || name == "." || name == string(filepath.Separator) {
+		name = "unnamed.json"
+	}
+	res := importResult{File: name}
+	if fh.Size > importMaxFileBytes {
+		res.Action = "failed"
+		res.Reason = fmt.Sprintf("文件超过 %dMB 上限", importMaxFileBytes>>20)
+		return res
+	}
+	f, err := fh.Open()
+	if err != nil {
+		res.Action = "failed"
+		res.Reason = "open: " + err.Error()
+		return res
+	}
+	defer func() { _ = f.Close() }()
+	raw, err := io.ReadAll(io.LimitReader(f, importMaxFileBytes+1))
 	if err != nil {
 		res.Action = "failed"
 		res.Reason = "read: " + err.Error()
@@ -176,7 +188,7 @@ func (p *Panel) importOne(src string) importResult {
 	p.cfg.Pool.Add(a)
 	p.cfg.Pool.Revive(uid) // 与登录路径同口径：清旧禁用/冷却/熔断，人工恢复语义
 	res.Action = "imported"
-	log.Printf("panel: 导入账号 uid=%s src=%s", uid, base)
+	log.Printf("panel: 导入账号 uid=%s src=%s", uid, name)
 	return res
 }
 
@@ -192,13 +204,4 @@ func resolveImportExpiry(c codebuddyCred) int64 {
 		base = time.Now().Unix()
 	}
 	return base + c.ExpiresIn
-}
-
-// defaultImportDir 默认扫描目录（跨平台 home 下 .codebuddy2api/credentials）。
-func defaultImportDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".codebuddy2api", "credentials")
 }

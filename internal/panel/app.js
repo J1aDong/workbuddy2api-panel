@@ -35,7 +35,8 @@ async function api(path, opts = {}) {
   const h = Object.assign({}, opts.headers || {});
   const k = localStorage.getItem(LS_KEY);
   if (k) h['Authorization'] = 'Bearer ' + k;
-  if (opts.body) h['Content-Type'] = 'application/json';
+  // FormData 由浏览器自动带 multipart boundary，手动设 Content-Type 会破坏分隔符。
+  if (opts.body && !(opts.body instanceof FormData)) h['Content-Type'] = 'application/json';
   const r = await fetch('/panel/api/' + path, Object.assign({}, opts, { headers: h }));
   if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
   const d = await r.json().catch(() => ({}));
@@ -519,11 +520,14 @@ function openAdd() {
   $('addVeil').classList.add('on');
   // 重置到选域态：选域可见、加载/就绪/完成/错误全收，起始按钮亮起。
   $('addPick').hidden = false;
-  // 批量导入区一并重置（结果与状态清空，保留上次输入的目录便于重试）。
+  // 批量导入区一并重置（文件选择、结果与状态清空）。
+  $('importFiles').value = '';
+  $('importPick').textContent = '未选择文件';
   $('importState').hidden = true; $('importState').textContent = '';
   $('importState').className = 'state';
   $('importResults').hidden = true; $('importResults').innerHTML = '';
   $('btnImport').disabled = false;
+  $('btnImport').textContent = '选择文件…';
   $('addLoad').hidden = true; $('addReady').hidden = true;
   $('addDone').hidden = true; $('addErr').hidden = true;
   $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
@@ -576,15 +580,23 @@ $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textCo
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
 
 /* ── 批量导入凭证 ─────────────────────────────────────────────────── */
-$('btnImport').onclick = async () => {
-  const btn = $('btnImport'), st = $('importState'), list = $('importResults');
-  btn.disabled = true;
-  st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">正在扫描并导入</span>';
+// 文件选择：input[type=file][multiple] 原生选择器，确认后立即上传导入。
+$('btnImport').onclick = () => $('importFiles').click();
+$('importFiles').onchange = async () => {
+  const inp = $('importFiles'), st = $('importState'), list = $('importResults');
+  const files = Array.from(inp.files || []);
+  if (!files.length) return;
+  $('importPick').textContent = '已选 ' + files.length + ' 个文件';
+  const btn = $('btnImport');
+  btn.disabled = true; btn.textContent = '导入中…';
+  st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">正在上传并导入</span>';
   list.hidden = true; list.innerHTML = '';
   try {
-    const r = await api('accounts/import', { method: 'POST', body: JSON.stringify({ dir: $('importDir').value.trim() }) });
+    const fd = new FormData();
+    files.forEach(f => fd.append('files', f));
+    const r = await api('accounts/import', { method: 'POST', body: fd });
     st.className = 'state ' + (r.failed ? 'err' : 'ok');
-    st.textContent = '扫描 ' + r.total + ' 个文件：导入 ' + r.imported + '，跳过 ' + r.skipped + '，失败 ' + r.failed;
+    st.textContent = '上传 ' + r.total + ' 个文件：导入 ' + r.imported + '，跳过 ' + r.skipped + '，失败 ' + r.failed;
     if (r.results && r.results.length) {
       list.innerHTML = r.results.map(x => {
         const tag = x.action === 'imported' ? '<span style="color:var(--ok)">✓ 已导入</span>'
@@ -598,7 +610,7 @@ $('btnImport').onclick = async () => {
     loadOverview(true);
   } catch (e) {
     st.className = 'state err'; st.textContent = e.message;
-  } finally { btn.disabled = false; }
+  } finally { btn.disabled = false; btn.textContent = '选择文件…'; }
 };
 
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */

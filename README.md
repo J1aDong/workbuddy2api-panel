@@ -494,7 +494,7 @@ http://127.0.0.1:7863/panel/
 | 视图 | 功能 |
 |---|---|
 | **账号池** | 统计条（总数/可用/冷却/禁用/可用积分合计/粘性会话）+ 账号表：状态标签（可用/限流冷却/积分冷却/熔断/已禁用）、积分量条、成功失败计数、在途、单号操作（签到/余额/任务/解冻/禁用/移除）；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」 |
-| **添加账号**（顶部按钮） | 浏览器内完成 OAuth 设备授权（显示授权链接 + 自动轮询），登录后凭证落盘并**热加载进池，免重启**；同弹窗支持**批量导入**本地凭证目录（扫描 `codebuddy_*.json`，转换后直接进池，见下） |
+| **添加账号**（顶部按钮） | 浏览器内完成 OAuth 设备授权（显示授权链接 + 自动轮询），登录后凭证落盘并**热加载进池，免重启**；同弹窗支持**批量导入**凭证文件（浏览器多选上传，见下） |
 | **积分任务**（账号行内「任务」按钮） | 展示全部任务（进度 / 奖励分数与能量 / 状态）；「全部接受」批量报名；「一键完成」覆盖 **17 个任务**（推进进度 + 异步计分等待 + **自动领奖**，幂等可重复点）；其余任务展示操作指引 |
 | **模型与档位** | 实时查询上游：每模型的积分倍率、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；若存在探测数据，最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」） |
 | **配置** | 在线编辑 config.json：API 密钥、定时任务（四类任务时点与开关、余额刷新间隔）、账号池与流量治理参数、上游超时与 UA、提示词模式、脱敏/粘性开关 |
@@ -510,12 +510,13 @@ http://127.0.0.1:7863/panel/
 
 面板后端接口挂在 `/panel/api/*`（同一 Bearer 鉴权），可脚本化调用；账号运维操作均落到池既有入口（`Revive`/`Disable`/`Remove` 等），与 `/status` 观测口径一致。
 
-**批量导入凭证目录**：添加账号弹窗底部支持扫描本地目录（默认 `~/.codebuddy2api/credentials`，可自定义），把 CodeBuddy CLI 网关的 `codebuddy_*.json` 扁平凭证（`bearer_token`/`refresh_token`/`uid`/`domain`）转换为 `auths/workbuddy-<uid>.json` 嵌套格式并**热加载进池（免重启）**，realm 按 `domain` 自动归一。逐文件结果三态：**导入成功** / **跳过**（`enabled=false`、或目标凭证已存在——不覆盖既有凭证，先删后导可重导）/ **失败**（缺 `bearer_token`/`refresh_token`、uid 非法或坏 JSON）。注意：`bearer_token` 为 `ck_` 开头 API Key 且无 `refresh_token` 的凭证无法导入（网关依赖 JWT 刷新链路）。脚本化调用：
+**批量导入凭证文件**：添加账号弹窗底部支持浏览器文件选择器**多选上传**凭证 JSON（如 CodeBuddy CLI 网关导出的 `codebuddy_*.json` 扁平凭证：`bearer_token`/`refresh_token`/`uid`/`domain`），转换为 `auths/workbuddy-<uid>.json` 嵌套格式并**热加载进池（免重启）**，realm 按 `domain` 自动归一。文件经浏览器上传而非服务端路径扫描，**网关部署在 Docker / 远端时同样可用**（凭证目录不必在服务器文件系统上）。逐文件结果三态：**导入成功** / **跳过**（`enabled=false`、或目标凭证已存在——不覆盖既有凭证，先移除可重导）/ **失败**（缺 `bearer_token`/`refresh_token`、uid 非法或坏 JSON）。上限：单文件 4MB、单次 200 个。注意：`bearer_token` 为 `ck_` 开头 API Key 且无 `refresh_token` 的凭证无法导入（网关依赖 JWT 刷新链路）。脚本化调用（multipart，字段名 `files`，可重复）：
 
 ```bash
 curl -X POST http://127.0.0.1:7863/panel/api/accounts/import \
-  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
-  -d '{"dir": "~/.codebuddy2api/credentials"}'
+  -H "Authorization: Bearer $API_KEY" \
+  -F "files=@codebuddy_13372319277.json" \
+  -F "files=@codebuddy_13484188036.json"
 ```
 
 **安全响应头**：面板页面与全部 `/panel/api/*` 响应统一带 `Content-Security-Policy`（`default-src 'none'`，脚本仅同源，`frame-ancestors 'none'` 禁嵌套）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 等；前端脚本独立为同源 `app.js`，不含内联脚本与内联事件处理器。

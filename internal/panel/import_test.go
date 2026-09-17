@@ -1,34 +1,43 @@
 package panel
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 )
 
-// postImport 以带鉴权的 POST 请求调用导入端点，返回响应 recorder。
-func postImport(t *testing.T, p *Panel, body string) *httptest.ResponseRecorder {
+// postImport 以带鉴权的 multipart POST 调用导入端点；files 为文件名 → 内容。
+func postImport(t *testing.T, p *Panel, files map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest("POST", "/panel/api/accounts/import", strings.NewReader(body))
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	for name, content := range files {
+		fw, err := mw.CreateFormFile("files", name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(fw, bytes.NewReader([]byte(content))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/panel/api/accounts/import", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
 	req.Header.Set("Authorization", "Bearer test-key")
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 	return rec
-}
-
-// writeSrc 在 srcDir 写一个 codebuddy 源凭证文件，返回文件名。
-func writeSrc(t *testing.T, srcDir, name, raw string) {
-	t.Helper()
-	if err := os.WriteFile(filepath.Join(srcDir, name), []byte(raw), 0o600); err != nil {
-		t.Fatal(err)
-	}
 }
 
 const validSrc = `{"bearer_token":"at-1","refresh_token":"rt-1","user_id":"13372319277",
@@ -54,25 +63,21 @@ func findResult(resp importResponse, file string) (importResult, bool) {
 }
 
 func TestImportAccounts(t *testing.T) {
-	srcDir := t.TempDir()
 	authDir := t.TempDir()
-	writeSrc(t, srcDir, "codebuddy_1001.json", validSrc)
-	// enabled=false：跳过
-	writeSrc(t, srcDir, "codebuddy_1002.json",
-		`{"bearer_token":"at","refresh_token":"rt","uid":"1002","enabled":false,"domain":"www.codebuddy.cn"}`)
-	// 缺 token：失败
-	writeSrc(t, srcDir, "codebuddy_1003.json",
-		`{"uid":"1003","enabled":true,"domain":"www.codebuddy.cn"}`)
-	// uid 非法字符：失败（防路径穿越）
-	writeSrc(t, srcDir, "codebuddy_1004.json",
-		`{"bearer_token":"at","refresh_token":"rt","uid":"../../evil","enabled":true,"domain":"www.codebuddy.cn"}`)
-	// 非 JSON：失败
-	writeSrc(t, srcDir, "codebuddy_1005.json", `not-json`)
-	// 不匹配 glob 的文件：忽略
-	writeSrc(t, srcDir, "other_1006.json", `{}`)
-
 	p := New(Config{Version: "test", APIKey: "test-key", AuthDir: authDir, Pool: pool.New("")})
-	rec := postImport(t, p, `{"dir":"`+srcDir+`"}`)
+
+	files := map[string]string{
+		"codebuddy_1001.json": validSrc,
+		// enabled=false：跳过
+		"codebuddy_1002.json": `{"bearer_token":"at","refresh_token":"rt","uid":"1002","enabled":false,"domain":"www.codebuddy.cn"}`,
+		// 缺 token：失败
+		"codebuddy_1003.json": `{"uid":"1003","enabled":true,"domain":"www.codebuddy.cn"}`,
+		// uid 非法字符：失败（防路径穿越）
+		"codebuddy_1004.json": `{"bearer_token":"at","refresh_token":"rt","uid":"../../evil","enabled":true,"domain":"www.codebuddy.cn"}`,
+		// 非 JSON：失败
+		"codebuddy_1005.json": `not-json`,
+	}
+	rec := postImport(t, p, files)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -95,6 +100,10 @@ func TestImportAccounts(t *testing.T) {
 	if r, _ := findResult(resp, "codebuddy_1005.json"); r.Action != "failed" {
 		t.Fatalf("1005: %+v", r)
 	}
+	// 路径穿越的 uid 没有落出 auths 目录。
+	if _, err := os.Stat(filepath.Join(authDir, "workbuddy-..")); !os.IsNotExist(err) {
+		t.Fatalf("traversal file exists: %v", err)
+	}
 
 	// 落盘文件为嵌套形，auth.Parse 可解析、realm=cn、过期时间 = created_at+expires_in。
 	raw, err := os.ReadFile(filepath.Join(authDir, "workbuddy-13372319277.json"))
@@ -115,41 +124,17 @@ func TestImportAccounts(t *testing.T) {
 	if st, ok := p.cfg.Pool.Status("13372319277"); !ok || st.Disabled {
 		t.Fatalf("pool status=%+v ok=%v", st, ok)
 	}
-}
 
-func TestImportAccountsIdempotence(t *testing.T) {
-	srcDir := t.TempDir()
-	authDir := t.TempDir()
-	writeSrc(t, srcDir, "codebuddy_2001.json", validSrc)
-
-	p := New(Config{Version: "test", APIKey: "test-key", AuthDir: authDir, Pool: pool.New("")})
-
-	// 首次导入成功。
-	rec := postImport(t, p, `{"dir":"`+srcDir+`"}`)
-	resp := decodeImport(t, rec)
-	if resp.Imported != 1 {
-		t.Fatalf("first import: %+v", resp)
-	}
-
-	// 重复导入：目标文件已存在 → skipped（幂等，不覆盖）。
-	rec = postImport(t, p, `{"dir":"`+srcDir+`"}`)
+	// 重复导入：同 uid 已存在 → skipped（幂等，不覆盖）。
+	rec = postImport(t, p, map[string]string{"codebuddy_1001.json": validSrc})
 	resp = decodeImport(t, rec)
 	if resp.Imported != 0 || resp.Skipped != 1 {
 		t.Fatalf("re-import: %+v", resp)
 	}
-	// 原文件未被改写（token 保持原值）。
-	raw, _ := os.ReadFile(filepath.Join(authDir, "workbuddy-13372319277.json"))
-	a, _ := auth.Parse(raw)
+	raw, _ = os.ReadFile(filepath.Join(authDir, "workbuddy-13372319277.json"))
+	a, _ = auth.Parse(raw)
 	if a.AccessToken != "at-1" {
 		t.Fatalf("token overwritten: %s", a.AccessToken)
-	}
-}
-
-func TestImportAccountsBadDir(t *testing.T) {
-	p := New(Config{Version: "test", APIKey: "test-key", AuthDir: t.TempDir(), Pool: pool.New("")})
-	rec := postImport(t, p, `{"dir":"/nonexistent/dir/xyz"}`)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -157,10 +142,9 @@ func TestImportAccountsBadDir(t *testing.T) {
 func TestImportAccountsCreatesAuthDir(t *testing.T) {
 	srcDir := t.TempDir()
 	authDir := filepath.Join(t.TempDir(), "nested", "auths")
-	writeSrc(t, srcDir, "codebuddy_3001.json", validSrc)
-
+	_ = srcDir
 	p := New(Config{Version: "test", APIKey: "test-key", AuthDir: authDir, Pool: pool.New("")})
-	rec := postImport(t, p, `{"dir":"`+srcDir+`"}`)
+	rec := postImport(t, p, map[string]string{"codebuddy_3001.json": validSrc})
 	resp := decodeImport(t, rec)
 	if resp.Imported != 1 {
 		t.Fatalf("import: %+v", resp)
@@ -170,9 +154,31 @@ func TestImportAccountsCreatesAuthDir(t *testing.T) {
 	}
 }
 
+func TestImportAccountsNoFiles(t *testing.T) {
+	p := New(Config{Version: "test", APIKey: "test-key", AuthDir: t.TempDir(), Pool: pool.New("")})
+	rec := postImport(t, p, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// 空 multipart（无 files 字段）与 JSON body（非 multipart）都报 400。
+	req := httptest.NewRequest("POST", "/panel/api/accounts/import", bytes.NewReader([]byte(`{"dir":"/x"}`)))
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec2 := httptest.NewRecorder()
+	p.ServeHTTP(rec2, req)
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("json body: code=%d", rec2.Code)
+	}
+}
+
 func TestImportAccountsAuthRequired(t *testing.T) {
 	p := New(Config{Version: "test", APIKey: "test-key", AuthDir: t.TempDir(), Pool: pool.New("")})
-	req := httptest.NewRequest("POST", "/panel/api/accounts/import", strings.NewReader(`{}`))
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, _ := mw.CreateFormFile("files", "a.json")
+	_, _ = fw.Write([]byte(validSrc))
+	_ = mw.Close()
+	req := httptest.NewRequest("POST", "/panel/api/accounts/import", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
